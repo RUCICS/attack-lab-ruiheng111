@@ -1,7 +1,9 @@
 # 栈溢出攻击实验
 
 ## 题目解决思路
+Problem1 中，先通过反汇编确定局部缓冲区到返回地址之间的固定偏移，在没有任何保护机制的前提下，直接用一段合适长度的 padding 覆盖到返回地址位置，再将返回地址改写为程序中已有、会输出 Yes!I like ICS! 的目标函数。Problem2 在此基础上引入了 NX 保护，栈不可执行，因此不能再往栈上塞自己的代码，而是通过构造 ROP 链：先利用 pop rdi; ret 这样的 gadget 设置好参数值，再跳转到目标函数 func2，成功输出指定字符串 Yes!I like ICS!，完成在 NX 环境下的控制流劫持。
 
+Problem3 利用 memcpy 将 64 字节数据拷贝进仅有 32 字节的 buf，覆盖 saved rbp 和返回地址，把返回地址改成 jmp_xs，再在 buf 开头布置一小段 shellcode，在栈上执行这段机器指令，设置参数为 114 并调用 func1(0x72)，从而打印出幸运数字 “Your luck numbe is 114”。Problem4 中程序开启了栈 canary，用于检测并阻止栈溢出覆盖返回地址，但通过分析汇编逻辑，可以发现其在处理用户输入时使用了无符号比较，导致输入 -1 时会被当作一个很大的正数从而误入“成功”分支，调用通关函数并正常退出。
 
 ### Problem 1: 
 - **分析**：problem1 程序存在典型的 栈缓冲区溢出漏洞。程序在读取用户输入文件内容时，未对输入长度进行有效检查，将输入数据直接拷贝到栈上的局部缓冲区中，从而导致当输入长度超过缓冲区大小时，后续的栈数据会被覆盖。
@@ -130,10 +132,71 @@ for i in range(0, len(payload), 8):
 - **结果**：![alt text](image-1.png)
 
 ### Problem 3: 
-- **分析**：...
-- **解决方案**：payload是什么，即你的python代码or其他能体现你payload信息的代码/图片
-- **结果**：附上图片
+- **分析**：main 从命令行读取一个文件名（例如 ans3.txt），用 fread 把文件内容读入栈上的一块缓冲区，然后把这块缓冲区的地址作为参数传给 func。也就是说，文件里的内容最终会被 func 当成一段字节数据来处理。
 
+在 func 中，先在栈上开了 0x30 字节的空间，然后定义了一个局部缓冲区 buf，大小为 0x20（32 字节）。接着执行：用 memcpy 把 0x40从我们传入的字符串拷贝到 buf。由于拷贝长度（64）大于 buf 大小（32），后面的 32 字节就会覆盖掉栈上的 saved rbp 和返回地址，形成栈溢出漏洞。在调用 memcpy 之前，func 还把当前的 rsp 保存到了一个全局变量 saved_rsp 中。
+
+此外，程序中还专门提供了一个辅助函数 jmp_xs：它会从全局变量 saved_rsp 中取出当时的栈指针，加上一个固定偏移，然后用 jmp 跳转到那块栈空间上执行。根据栈布局计算可知，这个跳转目标正好是 func 栈帧里 buf 的起始地址。
+
+查看 func1 的反汇编可以看到，它把参数（int 类型）保存在栈上，然后与常数 0x72 比较：
+如果参数等于 0x72（即十进制 114），就构造字符串 "Your luck numbe is 114" 并调用 puts 输出；否则输出错误提示。
+
+
+- **解决方案**：根据以上分析，我构造的payload代码执行思路如下：
+
+main 读取文件 ans3.txt，把内容传给 func；
+
+func 调用 memcpy，把我们构造的 64 字节 payload 拷贝到栈上，覆盖了 buf、saved rbp 和返回地址；
+
+func 执行 ret 时，不再回到 main，而是跳到我们写入的返回地址，也就是 jmp_xs；
+
+jmp_xs 根据 saved_rsp 计算出 buf 的起始位置，并 jmp 到那里；
+
+从 buf 开头开始执行我们布置好的那段小机器指令，设置参数为 114，并调用 func1(114)；
+
+func1 比较参数等于 0x72，于是输出 "Your luck numbe is 114"，完成题目要求。
+
+代码实现如下：
+
+```python
+
+shellcode = bytes([
+    0xbf, 0x72, 0x00, 0x00, 0x00,        # mov    $0x72,%edi
+    0x48, 0xc7, 0xc0, 0x16, 0x12, 0x40, 0x00,  # mov    $0x401216,%rax
+    0xff, 0xd0,                          # call   *%rax
+    0xc3                                 # ret
+])
+
+payload = b""
+
+
+payload += shellcode
+
+
+if len(payload) < 0x20:
+    payload += b"\x90" * (0x20 - len(payload))
+
+
+payload += b"B" * 8
+
+jmp_xs = 0x401334
+payload += jmp_xs.to_bytes(8, "little")
+
+if len(payload) < 0x40:
+    payload += b"C" * (0x40 - len(payload))
+
+print("payload length:", len(payload))
+
+with open("ans3.txt", "wb") as f:
+    f.write(payload)
+
+print("Payload written to ans3.txt")
+
+```
+
+- **结果**：
+
+![alt text](image-3.png)
 ### Problem 4: 
 - **分析**：Problem 4 中程序开启了 Stack Canary。
 在函数执行时，程序会在栈中保存一个随机的 canary 值，并在函数返回前检查该值是否被修改。
@@ -145,7 +208,9 @@ for i in range(0, len(payload), 8):
 - ![alt text](image-2.png)
 
 ## 思考与总结
+整个实验一开始只是简单地算偏移、覆盖返回地址，把程序跳到现成的打印函数上；往后慢慢变成要考虑调用约定（参数在 rdi）、小端序、函数地址、gadget 位置，再到在 NX 环境下不能执行栈上代码、必须用 ROP 链“拼”出等价的调用效果，最后甚至要结合全局变量 saved_rsp 和特殊跳板函数 jmp_xs，在栈上布置一段精简的机器指令来间接调用 func1(0x72) 输出幸运数字 114。整个过程让我非常直观地体会到：只要能精确控制“栈长什么样”“ret 跳到哪”，不论是 ret2func、ROP 还是 shellcode，实际上玩的都是同一套控制流劫持思路，只是受限条件不同，手段也随之变化。
 
+另一方面，Problem4 也提醒我：防护机制不是万能的。哪怕有 stack canary 这种专门用来防溢出的机制，只要程序在逻辑上用错了比较方式，攻击者就可以完全绕开栈溢出。这和前面几题通过覆盖返回地址的攻击方式完全不同，却同样能达到“通关效果”。通过这个lab，我对程序攻击有了更加深刻的认识，同时也更清楚地意识到：写程序时不仅要在实现层面注意边界检查、防止溢出，更要在设计和逻辑层面防止程序被攻击，确保安全。
 
 
 ## 参考资料
